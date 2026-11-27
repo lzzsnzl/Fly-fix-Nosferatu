@@ -1,0 +1,172 @@
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+if type(env.__NOS_FLYFIX_UNLOAD) == "function" then pcall(env.__NOS_FLYFIX_UNLOAD) end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then return end
+
+local actorsMod, sprintMod, cachedActor = nil, nil, nil
+local boundBtn, hoverBV = nil, nil
+local holding, descentActive, remainingDescent = false, false, 5
+local runtimeActive, unloaded = false, false
+local activeConns = {}
+
+local function isValidNosferatuMatch()
+	local char = LocalPlayer.Character
+	if not char then return false end
+	local pf = Workspace:FindFirstChild("Players")
+	local killers = pf and pf:FindFirstChild("Killers")
+	if not killers or char.Parent ~= killers then return false end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not (hum and hum.Health > 0) then return false end
+	local map = Workspace:FindFirstChild("Map")
+	local ingame = map and map:FindFirstChild("Ingame")
+	if not (ingame and ingame:FindFirstChild("Map")) then return false end
+	local id = (char.Name .. " " .. tostring(char:GetAttribute("CharacterName") or "") .. " " .. tostring(char:GetAttribute("ActorDisplayName") or "")):lower()
+	return id:find("nosferatu", 1, true) ~= nil
+end
+
+local function getActor(char)
+	if cachedActor and cachedActor.Rig == char then return cachedActor end
+	if not actorsMod then
+		local m = ReplicatedStorage:FindFirstChild("Modules")
+		local g = m and m:FindFirstChild("Gameplay")
+		local a = g and g:FindFirstChild("Actors")
+		if a and a:IsA("ModuleScript") then
+			local ok, mod = pcall(require, a)
+			if ok and type(mod) == "table" then actorsMod = mod end
+		end
+	end
+	local list = actorsMod and actorsMod.CurrentActors
+	if type(list) ~= "table" then return nil end
+	local act = list[LocalPlayer]
+	if type(act) ~= "table" then
+		for _, v in pairs(list) do
+			if type(v) == "table" and (v.Player == LocalPlayer or v.Rig == char) then
+				act = v
+				break
+			end
+		end
+	end
+	cachedActor = type(act) == "table" and act or nil
+	return cachedActor
+end
+
+local function bindSprintButton()
+	if boundBtn and boundBtn.Parent then return end
+	if not sprintMod then
+		local ok, mod = pcall(function() return require(ReplicatedStorage.Systems.Character.Game.Sprinting) end)
+		if ok and type(mod) == "table" then sprintMod = mod end
+	end
+	local btn = sprintMod and sprintMod.MobileButton
+	if typeof(btn) ~= "Instance" or not btn.Parent then return end
+
+	boundBtn = btn
+	activeConns[#activeConns + 1] = btn.MouseButton1Down:Connect(function()
+		if runtimeActive then holding = true end
+	end)
+	activeConns[#activeConns + 1] = btn.MouseButton1Up:Connect(function()
+		if runtimeActive then holding = false end
+	end)
+end
+
+local function stopRuntime()
+	if not runtimeActive then return end
+	runtimeActive = false
+	holding, descentActive, remainingDescent = false, false, 5
+	boundBtn, cachedActor = nil, nil
+	for _, c in ipairs(activeConns) do pcall(function() c:Disconnect() end) end
+	table.clear(activeConns)
+	if hoverBV then
+		pcall(function() hoverBV:Destroy() end)
+		hoverBV = nil
+	end
+end
+
+local function startRuntime()
+	if runtimeActive or unloaded then return end
+	runtimeActive = true
+	holding, descentActive, remainingDescent = false, false, 5
+
+	hoverBV = Instance.new("BodyVelocity")
+	hoverBV.Name = "DarkDescentFix"
+	hoverBV.MaxForce = Vector3.new(0, 1e10, 0)
+	hoverBV:SetAttribute("Perm", true)
+
+	activeConns[#activeConns + 1] = UserInputService.InputEnded:Connect(function(input)
+		if runtimeActive and holding and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1) then
+			holding = false
+		end
+	end)
+
+	activeConns[#activeConns + 1] = RunService.RenderStepped:Connect(function(dt)
+		if not runtimeActive then return end
+		local char = LocalPlayer.Character
+		if not char then return end
+
+		bindSprintButton()
+
+		local actor = getActor(char)
+		local st = actor and actor.State
+		local root = char.PrimaryPart or char:FindFirstChild("HumanoidRootPart")
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if not (st and root and hum) then
+			descentActive = false
+			if hoverBV and hoverBV.Parent then hoverBV.Parent = nil end
+			return
+		end
+
+		local inFlight = st.InFlight == true
+		local blocked = st.Slashing == true or (type(st.DescentStoppers) == "table" and next(st.DescentStoppers) ~= nil)
+
+		if blocked or not (holding and inFlight) then
+			if descentActive and inFlight and not blocked then
+				local flap = (actor.Config and actor.Config.AscentFlight and actor.Config.AscentFlight.FlapForce) or 30
+				local v = root.AssemblyLinearVelocity
+				root.AssemblyLinearVelocity = Vector3.new(v.X, flap, v.Z)
+				remainingDescent = 5
+			end
+			descentActive = false
+			if hoverBV and hoverBV.Parent then hoverBV.Parent = nil end
+		else
+			if not descentActive then
+				hoverBV.Velocity = root.AssemblyLinearVelocity
+				descentActive = true
+			end
+			local torso = char:FindFirstChild("Torso") or root
+			if hoverBV.Parent ~= torso then hoverBV.Parent = torso end
+
+			local targetY = math.clamp((5 - remainingDescent) - 1, 0, 1) * -15
+			local curV = hoverBV.Velocity
+			hoverBV.Velocity = Vector3.new(curV.X, curV.Y + (targetY - curV.Y) * (1 - 0.002 ^ dt), curV.Z)
+			remainingDescent = remainingDescent - dt
+		end
+
+		if hum.FloorMaterial ~= Enum.Material.Air then
+			remainingDescent = 5
+		end
+	end)
+end
+
+task.spawn(function()
+	while not unloaded do
+		if isValidNosferatuMatch() then
+			if not runtimeActive then startRuntime() end
+		else
+			if runtimeActive then stopRuntime() end
+		end
+		task.wait(0.4)
+	end
+end)
+
+env.__NOS_FLYFIX_UNLOAD = function()
+	if unloaded then return end
+	unloaded = true
+	stopRuntime()
+	env.__NOS_FLYFIX_UNLOAD = nil
+end
